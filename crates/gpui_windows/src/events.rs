@@ -437,6 +437,13 @@ impl WindowsWindowInner {
     }
 
     fn handle_keyup_msg(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
+        // The input method owns this key, and its keydown was left to the
+        // input method too: a keyup for the key underneath it would report a
+        // release of something that was never pressed.
+        if VIRTUAL_KEY(wparam.loword()) == VK_PROCESSKEY {
+            return Some(0);
+        }
+
         let Some(input) = handle_key_event(wparam, lparam, &self.state, |keystroke, _| {
             PlatformInput::KeyUp(KeyUpEvent { keystroke })
         }) else {

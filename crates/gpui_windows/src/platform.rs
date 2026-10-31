@@ -1186,6 +1186,17 @@ impl WindowsPlatformInner {
             return false;
         }
 
+        // The input method has claimed this key (`VK_PROCESSKEY`). Handed to
+        // GPUI it would be unwrapped back into the key under it — Backspace or
+        // Enter — and dispatched as an app shortcut before the input method saw
+        // it, so the field would edit or the draft send while a candidate was
+        // being picked. Left to `TranslateMessage`, which is what the message
+        // loop calls for a key this answers `false` for, it reaches the input
+        // method instead.
+        if VIRTUAL_KEY(msg.wParam.loword()) == VK_PROCESSKEY {
+            return false;
+        }
+
         self.window_from_hwnd(msg.hwnd)
             .is_some_and(|window| window.handle_keydown_msg(msg.wParam, msg.lParam) == Some(0))
     }

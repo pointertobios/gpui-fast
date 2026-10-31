@@ -112,7 +112,8 @@ mod apple_build {
     fn emit_stitched_shaders(header_path: &Path) {
         fn stitch_header(header: &Path, shader_path: &Path) -> std::io::Result<PathBuf> {
             let header_contents = std::fs::read_to_string(header)?;
-            let shader_contents = crate::fast_rounded_clip_shader::source(&std::fs::read_to_string(shader_path)?);
+            let shader_contents =
+                crate::fast_rounded_clip_shader::source(&std::fs::read_to_string(shader_path)?);
             let stitched_contents = format!("{header_contents}\n{shader_contents}");
             let out_path =
                 PathBuf::from(env::var("OUT_DIR").unwrap()).join("stitched_shaders.metal");

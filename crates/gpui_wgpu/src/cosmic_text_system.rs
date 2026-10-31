@@ -426,8 +426,14 @@ impl CosmicTextSystemState {
             // and emoji fonts often have no Latin glyphs, and they are exactly
             // what cosmic-text falls back to when the primary font lacks a
             // glyph.
+
+            // A face of colour glyphs is an emoji face, and no emoji face
+            // carries an 'm': it is loaded so that a run can be set in it, and
+            // so that cosmic-text's own fallback can reach it.
+            let color = is_color_face(&self.font_system, database_id);
             if font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
+                && !color
             {
                 continue;
             };
@@ -437,7 +443,7 @@ impl CosmicTextSystemState {
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: cosmic_features.clone(),
-                is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                is_known_emoji_font: check_is_known_emoji_font(&postscript_name) || color,
                 user_fallback_chain: Arc::clone(&user_fallback_chain),
             });
             self.loaded_font_ids_by_key.insert(key, font_id);
@@ -582,11 +588,12 @@ impl CosmicTextSystemState {
                 .face(id)
                 .context("fallback font face not found in cosmic-text database")?;
 
+            let color = is_color_face(&self.font_system, id);
             let font_id = FontId(self.loaded_fonts.len());
             self.loaded_fonts.push(LoadedFont {
                 font,
                 features: CosmicFontFeatures::new(),
-                is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
+                is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name) || color,
                 user_fallback_chain: Arc::from(Vec::new()),
             });
 
@@ -1202,6 +1209,43 @@ fn face_info_into_properties(
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // TODO: Include other common emoji fonts
     postscript_name == "NotoColorEmoji"
+}
+
+/// Whether a face draws colour glyphs: a CBDT/CBLC bitmap strike, a COLR/CPAL
+/// layer set, or an sbix bitmap set. Such a face is an emoji face — it has no
+/// Latin letters at all — and GPUI has to render it from its colour data rather
+/// than from an outline.
+fn is_color_face(font_system: &FontSystem, id: cosmic_text::fontdb::ID) -> bool {
+    font_system
+        .db()
+        .with_face_data(id, |data, index| has_color_tables(data, index))
+        .unwrap_or(false)
+}
+
+fn has_color_tables(data: &[u8], index: u32) -> bool {
+    let Some(offset) = sfnt_offset(data, index) else {
+        return false;
+    };
+    let Some(header) = data.get(offset..offset + 12) else {
+        return false;
+    };
+    let count = u16::from_be_bytes([header[4], header[5]]) as usize;
+    (0..count).any(|number| {
+        let at = offset + 12 + number * 16;
+        data.get(at..at + 4)
+            .is_some_and(|tag| matches!(tag, b"CBDT" | b"CBLC" | b"COLR" | b"CPAL" | b"sbix"))
+    })
+}
+
+/// Where the face at `index` starts: a font collection keeps an offset table
+/// per face, a plain font starts at zero.
+fn sfnt_offset(data: &[u8], index: u32) -> Option<usize> {
+    if data.get(0..4) != Some(b"ttcf") {
+        return (index == 0).then_some(0);
+    }
+    let at = 12 + index as usize * 4;
+    let bytes = data.get(at..at + 4)?;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
 }
 
 #[cfg(test)]

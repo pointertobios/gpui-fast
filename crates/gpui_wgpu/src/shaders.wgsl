@@ -1315,19 +1315,21 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    // The luma and chroma as they were encoded. `yuv.x` scales the luma byte,
+    // `yuv.y` is the value black sits at, and `yuv.z` scales the chroma away
+    // from its midpoint — 1 and 0 and 1 for full range, 255/219 and 16/255 and
+    // 255/224 for the video range a camera writes.
+    yuv: vec4<f32>,
+    // The two coefficients of each primary, from the matrix the track names.
+    // `yuv2.x` is red's Cr, `.y` green's Cb, `.z` green's Cr, `.w` blue's Cb.
+    yuv2: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
 @group(1) @binding(1) var t_y: texture_2d<f32>;
-@group(1) @binding(2) var t_cb_cr: texture_2d<f32>;
-@group(1) @binding(3) var s_surface: sampler;
-
-const ycbcr_to_RGB = mat4x4<f32>(
-    vec4<f32>( 1.0000f,  1.0000f,  1.0000f, 0.0),
-    vec4<f32>( 0.0000f, -0.3441f,  1.7720f, 0.0),
-    vec4<f32>( 1.4020f, -0.7141f,  0.0000f, 0.0),
-    vec4<f32>(-0.7010f,  0.5291f, -0.8860f, 1.0),
-);
+@group(1) @binding(2) var t_cb: texture_2d<f32>;
+@group(1) @binding(3) var t_cr: texture_2d<f32>;
+@group(1) @binding(4) var s_surface: sampler;
 
 struct SurfaceVarying {
     @builtin(position) position: vec4<f32>,
@@ -1348,15 +1350,28 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
 
 @fragment
 fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    // Sampling is what the picture is scaled by: the texture holds the film's
+    // own size and the quad is the size the window draws, so the hardware
+    // resamples and the conversion below runs once per pixel of the window.
+    let y = textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r;
+    let cb_sample = textureSampleLevel(t_cb, s_surface, input.texture_position, 0.0).r;
+    let cr_sample = textureSampleLevel(t_cr, s_surface, input.texture_position, 0.0).r;
+
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    let y_cb_cr = vec4<f32>(
-        textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r,
-        textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
-        1.0);
+    let luma = (y - surface_locals.yuv.y) * surface_locals.yuv.x;
+    // The chroma is a byte around 0.5 in the texture; the differences are what
+    // the matrix is applied to.
+    let cb = (cb_sample - 0.5) * surface_locals.yuv.z;
+    let cr = (cr_sample - 0.5) * surface_locals.yuv.z;
 
-    return ycbcr_to_RGB * y_cb_cr;
+    let rgb = vec3<f32>(
+        luma + surface_locals.yuv2.x * cr,
+        luma - surface_locals.yuv2.y * cb - surface_locals.yuv2.z * cr,
+        luma + surface_locals.yuv2.w * cb,
+    );
+    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }

@@ -2925,6 +2925,14 @@ impl Window {
         self.rendered_frame.scene.quads.clone()
     }
 
+    /// Returns the surfaces in the most recently rendered frame's scene, so a
+    /// test can assert on what a film actually put up: their bounds are in
+    /// scaled pixels, and the planes they sample are on them.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_surfaces(&self) -> Vec<crate::PaintSurface> {
+        self.rendered_frame.scene.surfaces.clone()
+    }
+
     /// Returns the underlines in the most recently rendered frame's scene.
     #[cfg(any(test, feature = "test-support"))]
     pub fn painted_underlines(&self) -> Vec<Underline> {
@@ -5235,6 +5243,30 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+        });
+    }
+
+    /// Paint a picture's planes into the scene for the next frame at the current
+    /// z-index, to be turned into RGB by the renderer's own sampler.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing. It is the portable counterpart of
+    /// [`Window::paint_surface`]: a platform whose renderer has an image buffer
+    /// of its own draws that instead, and one whose renderer samples planes
+    /// itself takes these.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn paint_planes(&mut self, bounds: Bounds<Pixels>, planes: std::sync::Arc<crate::Planes>) {
+        use crate::PaintSurface;
+
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            planes,
         });
     }
 

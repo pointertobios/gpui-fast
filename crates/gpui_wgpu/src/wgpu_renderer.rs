@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point,
+    PrimitiveBatch, ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -81,9 +81,42 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct SurfaceParams {
+pub(crate) struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    /// Luma scale, the value black sits at, chroma scale, unused.
+    yuv: [f32; 4],
+    /// Red's Cr, green's Cb, green's Cr, blue's Cb.
+    yuv2: [f32; 4],
+}
+
+impl SurfaceParams {
+    /// The coefficients that turn a picture's samples into RGB, from the range
+    /// and matrix the track names.
+    pub(crate) fn yuv(color: gpui::YuvColor) -> ([f32; 4], [f32; 4]) {
+        let (kr, kb) = match color.matrix {
+            // BT.601, both spellings.
+            5 | 6 => (0.299, 0.114),
+            // BT.2020's non-constant luminance form.
+            9 | 10 => (0.2627, 0.0593),
+            _ => (0.2126, 0.0722),
+        };
+        let kg = 1.0 - kr - kb;
+        let (luma_scale, black, chroma_scale) = if color.full_range {
+            (1.0, 0.0, 1.0)
+        } else {
+            (255.0 / 219.0, 16.0 / 255.0, 255.0 / 224.0)
+        };
+        (
+            [luma_scale, black, chroma_scale, 0.0],
+            [
+                2.0 * (1.0 - kr),
+                2.0 * (1.0 - kb) * kb / kg,
+                2.0 * (1.0 - kr) * kr / kg,
+                2.0 * (1.0 - kb),
+            ],
+        )
+    }
 }
 
 #[repr(C)]
@@ -132,8 +165,7 @@ pub(crate) struct WgpuPipelines {
     pub(crate) mono_sprites: wgpu::RenderPipeline,
     pub(crate) subpixel_sprites: Option<wgpu::RenderPipeline>,
     pub(crate) poly_sprites: wgpu::RenderPipeline,
-    #[allow(dead_code)]
-    surfaces: wgpu::RenderPipeline,
+    pub(crate) surfaces: wgpu::RenderPipeline,
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -161,7 +193,7 @@ pub(crate) struct WgpuBindGroupLayouts {
     pub(crate) globals: wgpu::BindGroupLayout,
     pub(crate) instances: wgpu::BindGroupLayout,
     pub(crate) texture: wgpu::BindGroupLayout,
-    surfaces: wgpu::BindGroupLayout,
+    pub(crate) surfaces: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -195,6 +227,330 @@ pub(crate) struct WgpuResources {
     pub(crate) path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     pub(crate) path_msaa_view: Option<wgpu::TextureView>,
+}
+
+/// One plane as a texture the shader samples: single channel, or two for the
+/// interleaved chroma.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn plane_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+/// The three textures one picture is sampled from, and the bind group that
+/// reads them.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn plane_surface(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    width: u32,
+    height: u32,
+) -> PlaneSurface {
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    let y = plane_texture(device, width, height, wgpu::TextureFormat::R8Unorm, "surface_y");
+    let cb = plane_texture(
+        device,
+        chroma_width,
+        chroma_height,
+        wgpu::TextureFormat::R8Unorm,
+        "surface_cb",
+    );
+    let cr = plane_texture(
+        device,
+        chroma_width,
+        chroma_height,
+        wgpu::TextureFormat::R8Unorm,
+        "surface_cr",
+    );
+    let y_view = y.create_view(&Default::default());
+    let cb_view = cb.create_view(&Default::default());
+    let cr_view = cr.create_view(&Default::default());
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("surface_params"),
+        size: std::mem::size_of::<SurfaceParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("surface_bind_group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&y_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&cb_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&cr_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    PlaneSurface {
+        width,
+        height,
+        y,
+        cb,
+        cr,
+        params,
+        bind_group,
+        uploaded: None,
+    }
+}
+
+/// Write one plane's bytes over the whole of its texture.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn write_plane(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32, bytes: &[u8]) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+/// A surface's planes on the GPU: three single-channel textures and the bind
+/// group that reads them.
+///
+/// A film hands a new set of planes thirty times a second, so this is made once
+/// and written into for as long as the film plays — making three textures a
+/// frame is what a driver answers slowly, and what leaves a card to collect the
+/// last ones at a moment of its own choosing.
+struct PlaneSurface {
+    width: u32,
+    height: u32,
+    /// Held so the textures outlive their views.
+    #[allow(dead_code)]
+    y: wgpu::Texture,
+    #[allow(dead_code)]
+    cb: wgpu::Texture,
+    #[allow(dead_code)]
+    cr: wgpu::Texture,
+    params: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// Which picture of the surface is in these textures. A repaint that brings
+    /// no new picture — a drag of the bar, a hover — is the one already there,
+    /// and writing it again would copy megabytes for nothing.
+    uploaded: Option<u64>,
+}
+
+/// How many frames a picture's slot is kept after it stops being drawn.
+///
+/// A film stepped away from and back is the same film, and a slot still holding
+/// its size is free. Two seconds of frames is long enough for that and short
+/// enough that a closed window gives its textures back in a moment nobody
+/// notices.
+const IDLE_FRAMES: u32 = 120;
+
+/// How many given-back slots are kept for later films.
+///
+/// A window shows one film at a time, and the most that can be waiting is one
+/// per size seen since the last few closed. Four is enough for stepping through
+/// a run of them and small enough that a stream whose resolution keeps changing
+/// does not leave the last few sizes of textures on the card for good.
+const FREE_SLOTS: usize = 4;
+
+/// What a picture is drawn with: the bind group of the slot it was written
+/// into, and the bounds the quad covers.
+pub(crate) struct SurfaceDraw {
+    pub(crate) bind_group: wgpu::BindGroup,
+}
+
+/// The pictures this renderer has on the GPU, and the slots the ones it has
+/// stopped drawing gave back.
+///
+/// A playing film owns one slot for as long as it is drawn and writes into it,
+/// so nothing is allocated a frame. A slot is given back once its film has gone
+/// [`IDLE_FRAMES`] frames without being painted, and the next film to open takes
+/// it rather than making three textures of its own — which is what makes opening
+/// and closing a film — or stepping through a run of them — cost nothing on the
+/// GPU.
+#[derive(Default)]
+pub(crate) struct PlaneSlots {
+    /// The slots being drawn, by the id their surface keeps.
+    held: FxHashMap<usize, HeldSlot>,
+    /// The slots nobody is drawing, kept for the next film. A slot is reused
+    /// only by a picture of its own size, so a set of textures is never
+    /// reallocated for a film that happens to match.
+    free: Vec<PlaneSurface>,
+}
+
+struct HeldSlot {
+    surface: PlaneSurface,
+    /// Frames drawn since this slot was last painted.
+    idle: u32,
+}
+
+impl PlaneSlots {
+    /// Write `planes` into this picture's slot, and say what draws them.
+    ///
+    /// The slot is the film's and stays the film's, so a film is thirty
+    /// pictures a second on one set of textures. A slot from a film that has
+    /// been closed is taken here rather than three textures being made, and a
+    /// repaint that brings no new picture — a hover, a drag of the bar — is the
+    /// same allocation, whose bytes are already on the GPU.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub(crate) fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        bounds: Bounds<ScaledPixels>,
+        content_mask: Bounds<ScaledPixels>,
+        planes: &Arc<gpui::Planes>,
+    ) -> Option<SurfaceDraw> {
+        let (width, height) = (planes.width.max(1), planes.height.max(1));
+        if planes.y.len() < (width * height) as usize {
+            return None;
+        }
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
+        let id = planes.id;
+        let held = self.slot(device, layout, sampler, id, width, height);
+
+        let (yuv, yuv2) = SurfaceParams::yuv(planes.color);
+        queue.write_buffer(
+            &held.params,
+            0,
+            bytemuck::bytes_of(&SurfaceParams {
+                bounds: bounds.into(),
+                content_mask: content_mask.into(),
+                yuv,
+                yuv2,
+            }),
+        );
+        if held.uploaded != Some(planes.frame) {
+            held.uploaded = Some(planes.frame);
+            write_plane(queue, &held.y, width, height, &planes.y);
+            write_plane(queue, &held.cb, chroma_width, chroma_height, &planes.cb);
+            write_plane(queue, &held.cr, chroma_width, chroma_height, &planes.cr);
+        }
+        let bind_group = held.bind_group.clone();
+        self.painted(id);
+        Some(SurfaceDraw { bind_group })
+    }
+
+    /// The slot for `id`, taking one from the free list or making one.
+    ///
+    /// A film whose picture changed size — the next episode of a series, a
+    /// stream that switched rendition — is given a slot of the new size; the one
+    /// it had is not its size any more and is dropped.
+    fn slot(
+        &mut self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        id: usize,
+        width: u32,
+        height: u32,
+    ) -> &mut PlaneSurface {
+        let sized = |surface: &PlaneSurface| surface.width == width && surface.height == height;
+        if let Some(held) = self.held.get(&id) {
+            if sized(&held.surface) {
+                return &mut self.held.get_mut(&id).expect("held").surface;
+            }
+            // Its size changed: the textures are a picture of the old one.
+            self.held.remove(&id);
+        }
+        let surface = match self.free.iter().position(sized) {
+            // Whatever it last held belongs to the film that left it, and this
+            // one's pictures are counted from its own start: a slot handed on
+            // with the last film's count would take the next film's first
+            // picture for one already on the GPU and draw the film before it.
+            Some(at) => {
+                let mut surface = self.free.remove(at);
+                surface.uploaded = None;
+                surface
+            }
+            None => plane_surface(device, layout, sampler, width, height),
+        };
+        self.held.insert(
+            id,
+            HeldSlot {
+                surface,
+                idle: 0,
+            },
+        );
+        &mut self.held.get_mut(&id).expect("just held").surface
+    }
+
+    /// Note that `id` was painted this frame.
+    fn painted(&mut self, id: usize) {
+        if let Some(held) = self.held.get_mut(&id) {
+            held.idle = 0;
+        }
+    }
+
+    /// After a frame: every slot not painted this frame has been idle one frame
+    /// longer, and one idle long enough gives its textures back.
+    pub(crate) fn end_of_frame(&mut self) {
+        let mut returned = Vec::new();
+        for held in self.held.values_mut() {
+            held.idle += 1;
+        }
+        let spent: Vec<usize> = self
+            .held
+            .iter()
+            .filter(|(_, held)| held.idle > IDLE_FRAMES)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in spent {
+            if let Some(held) = self.held.remove(&id) {
+                returned.push(held.surface);
+            }
+        }
+        // The oldest goes first: a size a film has just left is likelier to be
+        // the next film's than one nothing has asked for since.
+        self.free.extend(returned);
+        if self.free.len() > FREE_SLOTS {
+            self.free.drain(..self.free.len() - FREE_SLOTS);
+        }
+    }
 }
 
 struct CachedTextureBindGroup {
@@ -610,6 +966,16 @@ impl WgpuRendererCore {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -1602,8 +1968,8 @@ impl WgpuRendererCore {
                             &mut pass,
                         )?;
                     }
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
+                    // Drawn by the fast path, which every frame goes
+                    // through; see `fast::frame`.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
                 }
             }

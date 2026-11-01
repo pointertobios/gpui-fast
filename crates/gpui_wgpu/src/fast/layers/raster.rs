@@ -53,6 +53,7 @@ pub(crate) fn clear_color(background: Rgba) -> wgpu::Color {
 pub(crate) fn rasterize(
     target: &FrameTarget,
     state: &FrameState,
+    planes: &mut crate::wgpu_renderer::PlaneSlots,
     encoder: &mut wgpu::CommandEncoder,
     layers: &SceneLayers,
     tile: &TileRaster,
@@ -75,7 +76,7 @@ pub(crate) fn rasterize(
         target,
         state,
         encoder,
-        &SceneDraw {
+        &mut SceneDraw {
             scene: &tile.scene,
             upload,
             paths,
@@ -90,6 +91,7 @@ pub(crate) fn rasterize(
                 msaa: tile_paths.msaa.as_ref(),
             },
             graph,
+            planes,
         },
     );
 }

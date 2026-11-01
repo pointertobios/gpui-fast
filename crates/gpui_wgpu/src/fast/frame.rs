@@ -63,6 +63,10 @@ pub(crate) struct FrameState {
     pub(crate) bind_groups: BindGroupCache,
     pub(crate) globals: UploadedGlobals,
     pub(crate) layers: TileCache,
+    /// The pictures this renderer has on the GPU, and the slots the ones it has
+    /// stopped drawing gave back. It lives here rather than with the resources
+    /// because a slot is given back by a frame, and this is what a frame has.
+    pub(crate) planes: crate::wgpu_renderer::PlaneSlots,
     vertices: Vec<PathRasterizationVertex>,
     sprites: Vec<PathSprite>,
     path_batches: Vec<PathBatch>,
@@ -307,6 +311,7 @@ fn record_with(
         path_batches,
     );
 
+    let mut planes = std::mem::take(&mut state.planes);
     let result = upload(host, &state.bind_groups, &scenes, &vertices, &sprites)
         .with_context(|| {
             format!(
@@ -325,9 +330,15 @@ fn record_with(
             let target = host.target()?;
             state.layers.prepare(&target, &scene.layers, &planned);
             Ok(record(
-                &target, state, scene, frame_view, clear, &rasters, &raster_indices, &scenes, &uploads, &paths,
+                &target, state, &mut planes, scene, frame_view, clear, &rasters, &raster_indices,
+                &scenes, &uploads, &paths,
             ))
         });
+    // A picture drawn this frame keeps its slot and writes into it next frame;
+    // one that has not been drawn for long enough gives it back, so the film
+    // opened after it starts from a slot rather than from three textures.
+    planes.end_of_frame();
+    state.planes = planes;
     if result.is_err() {
         // The tiles this frame was to rasterize were not.
         state.layers.clear();
@@ -586,6 +597,7 @@ unsafe fn bytes_of<T>(instances: &[T]) -> &[u8] {
 fn record(
     target: &FrameTarget,
     state: &FrameState,
+    planes: &mut crate::wgpu_renderer::PlaneSlots,
     scene: &Scene,
     frame_view: &wgpu::TextureView,
     clear: wgpu::Color,
@@ -607,6 +619,7 @@ fn record(
         raster::rasterize(
             target,
             state,
+            planes,
             &mut encoder,
             &scene.layers,
             tile,
@@ -621,7 +634,7 @@ fn record(
         target,
         state,
         &mut encoder,
-        &SceneDraw {
+        &mut SceneDraw {
             scene,
             upload: &uploads[main],
             paths,
@@ -636,6 +649,7 @@ fn record(
                 msaa: target.path_msaa_view,
             },
             graph: &graph,
+            planes,
         },
     );
     target.queue.submit(std::iter::once(encoder.finish()))
@@ -654,6 +668,8 @@ pub(crate) struct SceneDraw<'a> {
     pub(crate) globals: &'a wgpu::BindGroup,
     pub(crate) path_targets: PathTargets<'a>,
     pub(crate) graph: &'a DrawGraph<'a>,
+    /// Where a picture's planes are written, and the slots to write them into.
+    pub(crate) planes: &'a mut crate::wgpu_renderer::PlaneSlots,
 }
 
 /// What a scene's paths are rasterized with: the globals and the
@@ -758,7 +774,7 @@ pub(crate) fn draw_scene(
     target: &FrameTarget,
     state: &FrameState,
     encoder: &mut wgpu::CommandEncoder,
-    draw: &SceneDraw,
+    draw: &mut SceneDraw,
 ) {
     let pipelines = target.pipelines;
     let texture_bind_group = |label: &str, view: &wgpu::TextureView| {
@@ -957,9 +973,32 @@ pub(crate) fn draw_scene(
                     range,
                 );
             }
-            // Surfaces are macOS-only for video playback and are not
-            // implemented by the WGPU renderer.
-            PrimitiveBatch::Surfaces(_surfaces) => {}
+            PrimitiveBatch::Surfaces(range) => {
+                // A picture's planes, written into the film's own slot and
+                // drawn as one quad: the shader turns Y and CbCr into RGB and
+                // the sampler scales the film's size to the size of the quad,
+                // so neither happens on the CPU.
+                for surface in &scene.surfaces[range] {
+                    // The atlas's sampler is the one a picture wants too: linear
+                    // both ways, clamped at the edges, which is what lets the
+                    // film's own size be drawn at the size of the quad.
+                    let Some(picture) = draw.planes.upload(
+                        target.device,
+                        target.queue,
+                        &target.bind_group_layouts.surfaces,
+                        target.atlas_sampler,
+                        surface.bounds,
+                        surface.content_mask.bounds,
+                        &surface.planes,
+                    ) else {
+                        continue;
+                    };
+                    bound.set_pipeline(&mut pass, &pipelines.surfaces);
+                    bound.set_bind_group(&mut pass, 0, draw.globals);
+                    bound.set_bind_group(&mut pass, 1, &picture.bind_group);
+                    pass.draw(0..4, 0..1);
+                }
+            }
         }
     }
     drop(pass);

@@ -5507,6 +5507,21 @@ impl Window {
         }
     }
 
+    /// The field that drew itself as a text input this frame and holds the
+    /// focus, if there is one.
+    ///
+    /// This is the field GPUI handed the platform as the input handler — the
+    /// one a composition is typed into — rather than whatever handle the focus
+    /// points at: a view that has not changed since the last frame is drawn
+    /// again from that frame and never runs its own render, so an element that
+    /// has left the tree and an element whose frame was reused look the same
+    /// from the outside. A platform that draws a keyboard of its own asks this
+    /// to know whether the field it raised the keyboard for is still on screen.
+    pub fn focused_text_input(&self, cx: &App) -> Option<FocusHandle> {
+        self.focused_text_input
+            .and_then(|id| FocusHandle::for_id(id, &cx.focus_handles))
+    }
+
     /// Notifies native text services that the focused component's text changed.
     ///
     /// Text components should call this after application-driven edits, in addition
